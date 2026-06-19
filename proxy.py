@@ -1,16 +1,21 @@
 """
-enowxai-proxy: Lightweight OpenAI-compat proxy for Firecrawl → enowxai.
+enowxai-proxy: Lightweight 0penAI-compat proxy for Firecrawl → enowxai.
 
-Transforms requests that use response_format/json_schema (Vercel AI SDK generateObject)
-into plain chat completions that enowxai/kiro can handle:
-  1. Strips response_format entirely
-  2. Injects a system message instructing JSON-only output with the schema
-  3. Forces stream: false
-  4. Forwards to upstream enowxai
+Firecrawl uses Vercel AI SDK's generateObject which sends structured output
+requests using TOOL CALLING (not response_format). The tool is always named
+"json" and contains the full JSON schema.
+
+enowxai/kiro doesn't support tool calling, so:
+1. We strip the tools/tool_choice from the request
+2. We inject a system message with the schema and a JSON-only instruction
+3. We force stream: false
+4. We take the plain text response and synthesize a tool_calls response
+   so the Vercel AI SDK can parse it correctly
+
+This makes Firecrawl's extract feature work without OpenRouter.
 """
 import json
 import os
-import re
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -21,44 +26,60 @@ UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://enowxai.waterflai.my.id/
 client = httpx.AsyncClient(timeout=120.0)
 
 
-def build_schema_system_message(response_format: dict) -> str | None:
-    """Extract JSON schema from response_format and build a system instruction."""
-    if not response_format:
-        return None
-    fmt_type = response_format.get("type", "")
-    if fmt_type == "json_schema":
-        js = response_format.get("json_schema", {})
-        schema = js.get("schema", {})
-        schema_str = json.dumps(schema, separators=(",", ":"))
-        return (
-            "You MUST respond with ONLY valid JSON that strictly matches this schema. "
-            "No explanation, no markdown, no code blocks — raw JSON only.\n"
-            f"Schema: {schema_str}"
-        )
-    elif fmt_type == "json_object":
-        return "You MUST respond with ONLY valid JSON. No explanation, no markdown, no code blocks — raw JSON only."
+def extract_json_schema_from_tools(tools: list) -> dict | None:
+    """Extract the JSON schema from Vercel AI SDK's tool-based generateObject request."""
+    for tool in tools or []:
+        fn = tool.get("function", {})
+        if fn.get("name") == "json":
+            return fn.get("parameters")
     return None
 
 
-def transform_body(body: dict) -> dict:
-    """Strip response_format, inject system message, force stream:false."""
-    body = dict(body)  # shallow copy
+def strip_markdown_fences(text: str) -> str:
+    """Remove ```json ... ``` or ``` ... ``` wrappers from model output."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")[1:]  # drop opening fence
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]  # drop closing fence
+        return "\n".join(lines).strip()
+    return stripped
 
-    # Force non-streaming
-    body["stream"] = False
 
-    # Extract response_format before removing it
-    response_format = body.pop("response_format", None)
+def fix_nulls(obj):
+    """Replace null values with empty strings for schema compatibility."""
+    if isinstance(obj, dict):
+        return {k: ("" if v is None else fix_nulls(v)) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [fix_nulls(i) for i in obj]
+    return obj
 
-    # Build system instruction from schema
-    system_instruction = build_schema_system_message(response_format)
 
-    if system_instruction:
+def transform_request(body: dict) -> tuple[dict, bool]:
+    """
+    Transform a tool-calling generateObject request into a plain chat request.
+    Returns (transformed_body, had_tool_schema).
+    """
+    body = dict(body)
+    body["stream"] = False  # force non-streaming
+
+    # Extract tool schema if present
+    tools = body.pop("tools", None)
+    body.pop("tool_choice", None)
+
+    schema = extract_json_schema_from_tools(tools)
+    had_tool_schema = schema is not None
+
+    if schema:
+        schema_str = json.dumps(schema, separators=(",", ":"))
+        system_instruction = (
+            "You MUST respond with ONLY valid JSON that strictly matches this schema. "
+            "No explanation, no markdown code blocks, no extra text — raw JSON only.\n"
+            f"Schema: {schema_str}"
+        )
         messages = body.get("messages", [])
-        # Check if there's already a system message
         has_system = any(m.get("role") == "system" for m in messages)
         if has_system:
-            # Prepend to existing system message
             new_messages = []
             for m in messages:
                 if m.get("role") == "system":
@@ -70,34 +91,57 @@ def transform_body(body: dict) -> dict:
                     new_messages.append(m)
             body["messages"] = new_messages
         else:
-            # Inject as first message
             body["messages"] = [{"role": "system", "content": system_instruction}] + messages
 
-    return body
+    return body, had_tool_schema
+
+
+def synthesize_tool_call_response(resp_body: dict, tool_name: str = "json") -> dict:
+    """
+    Take the upstream response (plain text JSON in message.content) and
+    synthesize it into a tool_calls response that the Vercel AI SDK expects.
+    """
+    for choice in resp_body.get("choices", []):
+        msg = choice.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            clean = strip_markdown_fences(content)
+            try:
+                parsed = json.loads(clean)
+                fixed = fix_nulls(parsed)
+                args_str = json.dumps(fixed, separators=(",", ":"))
+            except Exception:
+                args_str = clean
+
+            # Replace plain content with tool_calls
+            msg["content"] = None
+            msg["tool_calls"] = [{
+                "id": f"call_{tool_name}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": args_str
+                }
+            }]
+            choice["finish_reason"] = "tool_calls"
+    return resp_body
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request):
     url = f"{UPSTREAM}/{path}"
     headers = dict(request.headers)
-    # Remove host header — httpx sets it automatically
     headers.pop("host", None)
-    headers.pop("content-length", None)  # will be recalculated
+    headers.pop("content-length", None)
 
-    # Only transform POST to chat/completions
+    had_tool_schema = False
+
     if request.method == "POST" and "chat/completions" in path:
         try:
             body = await request.json()
-            had_response_format = "response_format" in body
-            body = transform_body(body)
+            body, had_tool_schema = transform_request(body)
             content = json.dumps(body).encode()
             headers["content-type"] = "application/json"
-            import logging
-            logging.getLogger("uvicorn").info(
-                f"[proxy] transformed: had_response_format={had_response_format} "
-                f"stream={body.get('stream')} model={body.get('model')} "
-                f"msgs={len(body.get('messages', []))}"
-            )
         except Exception as e:
             import logging
             logging.getLogger("uvicorn").error(f"[proxy] transform error: {e}")
@@ -112,37 +156,22 @@ async def proxy(path: str, request: Request):
         content=content,
     )
 
-    # For chat/completions POST: strip markdown code blocks from content
+    # For chat/completions POST with tool schema: synthesize tool_calls response
     if request.method == "POST" and "chat/completions" in path:
         try:
             resp_body = resp.json()
-            for choice in resp_body.get("choices", []):
-                msg = choice.get("message", {})
-                text = msg.get("content", "")
-                if isinstance(text, str):
-                    stripped = text.strip()
-                    if stripped.startswith("```"):
-                        lines = stripped.split("\n")[1:]
-                        if lines and lines[-1].strip() == "```":
-                            lines = lines[:-1]
-                        stripped = "\n".join(lines).strip()
-                    # Validate it's JSON and fix null union types
-                    try:
-                        parsed = json.loads(stripped)
-                        # Replace null string/null unions with empty string
-                        def fix_nulls(obj):
-                            if isinstance(obj, dict):
-                                return {k: ("" if v is None else fix_nulls(v)) for k, v in obj.items()}
-                            elif isinstance(obj, list):
-                                return [fix_nulls(i) for i in obj]
-                            return obj
-                        fixed = fix_nulls(parsed)
-                        msg["content"] = json.dumps(fixed, separators=(",", ":"))
-                    except Exception:
-                        msg["content"] = stripped
+            if had_tool_schema:
+                resp_body = synthesize_tool_call_response(resp_body)
+            else:
+                # No tool schema — just strip markdown fences from plain responses
+                for choice in resp_body.get("choices", []):
+                    msg = choice.get("message", {})
+                    text = msg.get("content", "")
+                    if isinstance(text, str) and text.strip().startswith("```"):
+                        msg["content"] = strip_markdown_fences(text)
             return JSONResponse(content=resp_body, status_code=resp.status_code)
         except Exception:
-            pass  # fall through to raw response
+            pass
 
     return Response(
         content=resp.content,
