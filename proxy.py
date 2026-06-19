@@ -103,6 +103,25 @@ async def proxy(path: str, request: Request):
         content=content,
     )
 
+    # For chat/completions POST: strip markdown code blocks from content
+    if request.method == "POST" and "chat/completions" in path:
+        try:
+            resp_body = resp.json()
+            for choice in resp_body.get("choices", []):
+                msg = choice.get("message", {})
+                text = msg.get("content", "")
+                if isinstance(text, str):
+                    stripped = text.strip()
+                    if stripped.startswith("```"):
+                        lines = stripped.split("\n")
+                        lines = lines[1:]  # drop opening fence line
+                        if lines and lines[-1].strip() == "```":
+                            lines = lines[:-1]  # drop closing fence
+                        msg["content"] = "\n".join(lines).strip()
+            return JSONResponse(content=resp_body, status_code=resp.status_code)
+        except Exception:
+            pass  # fall through to raw response
+
     return Response(
         content=resp.content,
         status_code=resp.status_code,
