@@ -26,6 +26,11 @@ UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://enowxai.waterflai.my.id/
 client = httpx.AsyncClient(timeout=120.0)
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "upstream": UPSTREAM}
+
+
 def extract_json_schema_from_tools(tools: list) -> dict | None:
     """Extract the JSON schema from Vercel AI SDK's tool-based generateObject request."""
     for tool in tools or []:
@@ -175,12 +180,16 @@ async def proxy(path: str, request: Request):
                     text = msg.get("content", "")
                     if isinstance(text, str) and text.strip().startswith("```"):
                         msg["content"] = strip_markdown_fences(text)
-            return JSONResponse(content=resp_body, status_code=resp.status_code)
+            r = JSONResponse(content=resp_body, status_code=resp.status_code)
+            r.headers["X-Proxy-Hit"] = "1"
+            return r
         except Exception:
             pass
 
-    return Response(
+    r = Response(
         content=resp.content,
         status_code=resp.status_code,
         headers=dict(resp.headers),
     )
+    r.headers["X-Proxy-Hit"] = "1"
+    return r
