@@ -88,10 +88,19 @@ async def proxy(path: str, request: Request):
     if request.method == "POST" and "chat/completions" in path:
         try:
             body = await request.json()
+            had_response_format = "response_format" in body
             body = transform_body(body)
             content = json.dumps(body).encode()
             headers["content-type"] = "application/json"
-        except Exception:
+            import logging
+            logging.getLogger("uvicorn").info(
+                f"[proxy] transformed: had_response_format={had_response_format} "
+                f"stream={body.get('stream')} model={body.get('model')} "
+                f"msgs={len(body.get('messages', []))}"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("uvicorn").error(f"[proxy] transform error: {e}")
             content = await request.body()
     else:
         content = await request.body()
