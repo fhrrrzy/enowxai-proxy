@@ -63,6 +63,12 @@ def transform_request(body: dict) -> tuple[dict, bool]:
     body = dict(body)
     body["stream"] = False  # force non-streaming
 
+    # Normalize any 0penAI model names to kiro/claude-haiku-4.5
+    # (Firecrawl hardcodes gpt-4o-mini/gpt-4.1-mini but enowxai doesn't have them)
+    model = body.get("model", "")
+    if any(m in model for m in ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4"]):
+        body["model"] = "kiro/claude-haiku-4.5"
+
     # Extract tool schema if present
     tools = body.pop("tools", None)
     body.pop("tool_choice", None)
