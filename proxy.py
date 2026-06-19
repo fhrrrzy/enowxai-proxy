@@ -122,11 +122,24 @@ async def proxy(path: str, request: Request):
                 if isinstance(text, str):
                     stripped = text.strip()
                     if stripped.startswith("```"):
-                        lines = stripped.split("\n")
-                        lines = lines[1:]  # drop opening fence line
+                        lines = stripped.split("\n")[1:]
                         if lines and lines[-1].strip() == "```":
-                            lines = lines[:-1]  # drop closing fence
-                        msg["content"] = "\n".join(lines).strip()
+                            lines = lines[:-1]
+                        stripped = "\n".join(lines).strip()
+                    # Validate it's JSON and fix null union types
+                    try:
+                        parsed = json.loads(stripped)
+                        # Replace null string/null unions with empty string
+                        def fix_nulls(obj):
+                            if isinstance(obj, dict):
+                                return {k: ("" if v is None else fix_nulls(v)) for k, v in obj.items()}
+                            elif isinstance(obj, list):
+                                return [fix_nulls(i) for i in obj]
+                            return obj
+                        fixed = fix_nulls(parsed)
+                        msg["content"] = json.dumps(fixed, separators=(",", ":"))
+                    except Exception:
+                        msg["content"] = stripped
             return JSONResponse(content=resp_body, status_code=resp.status_code)
         except Exception:
             pass  # fall through to raw response
